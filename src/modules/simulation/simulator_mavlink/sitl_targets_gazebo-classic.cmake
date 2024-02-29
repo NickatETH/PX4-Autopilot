@@ -72,6 +72,7 @@ if(gazebo_FOUND)
 
 	set(models
 		advanced_plane
+		noctua
 		believer
 		boat
 		cloudship
