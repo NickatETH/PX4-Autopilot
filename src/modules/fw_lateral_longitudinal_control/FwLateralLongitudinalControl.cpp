@@ -297,9 +297,7 @@ void FwLateralLongitudinalControl::Run()
 			float roll_body = PX4_ISFINITE(roll_sp) ? roll_sp : 0.0f;
 			float pitch_body = PX4_ISFINITE(pitch_sp) ? pitch_sp : 0.0f;
 
-			const float V = fmaxf(airspeed_vector.norm(), 3.0f); // Guard against division by zero
 			float yaw_body = _yaw;
-			yaw_body += tanf(roll_body) * CONSTANTS_ONE_G / V; // feedforward turn rate for coordinated turns
 
 			const float thrust_body_x = PX4_ISFINITE(throttle_sp) ? throttle_sp : 0.0f;
 

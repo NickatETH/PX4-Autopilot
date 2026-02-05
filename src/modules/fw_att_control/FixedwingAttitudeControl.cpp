@@ -92,10 +92,8 @@ FixedwingAttitudeControl::parameters_update()
 }
 
 void
-FixedwingAttitudeControl::vehicle_manual_poll(matrix::Quatf R, float airspeed, float dt)
+FixedwingAttitudeControl::vehicle_manual_poll(const float yaw_body)
 {
-	const matrix::Eulerf euler_angles(R);
-
 	if (_vcontrol_mode.flag_control_manual_enabled && _in_fw_or_transition_wo_tailsitter_transition) {
 
 		// Always copy the new manual setpoint, even if it wasn't updated, to fill the actuators with valid values
@@ -105,18 +103,12 @@ FixedwingAttitudeControl::vehicle_manual_poll(matrix::Quatf R, float airspeed, f
 
 				// STABILIZED mode generate the attitude setpoint from manual user inputs
 
-				float roll_body = _manual_control_setpoint.roll * radians(_param_fw_man_r_max.get());
+				const float roll_body = _manual_control_setpoint.roll * radians(_param_fw_man_r_max.get());
 
 				float pitch_body = -_manual_control_setpoint.pitch * radians(_param_fw_man_p_max.get())
 						   + radians(_param_fw_psp_off.get());
 				pitch_body = constrain(pitch_body,
 						       -radians(_param_fw_man_p_max.get()), radians(_param_fw_man_p_max.get()));
-
-				const float V = fmaxf(airspeed, 3.0f); // Guard against division by zero
-				float yaw_body = euler_angles.psi();
-				yaw_body += tanf(roll_body) * 9.81f / V; // feedforward turn rate for coordinated turns
-
-				roll_body  *= cosf(pitch_body); //
 
 				_att_sp.thrust_body[0] = (_manual_control_setpoint.throttle + 1.f) * .5f;
 
@@ -267,7 +259,7 @@ void FixedwingAttitudeControl::Run()
 
 		const matrix::Eulerf euler_angles(_R);
 
-		vehicle_manual_poll(_R, get_airspeed_constrained(), dt);
+		vehicle_manual_poll(euler_angles.psi());
 
 		vehicle_attitude_setpoint_poll();
 
@@ -334,31 +326,168 @@ void FixedwingAttitudeControl::Run()
 
 
 					///////////////////////////////////////////////////////////////////////////
-					// NEW: Quaternion based controller
+					// Quaternion / geometric tilt-priority attitude controller
 					///////////////////////////////////////////////////////////////////////////
-					const Quatf q_current(att.q);
-					Quatf q_sp_modified = q_sp;
 
-					// Enforce quaternion hemisphere consistency
-					if (q_current.dot(q_sp_modified) < 0.f) {
-						q_sp_modified = -q_sp_modified;
+					// Current attitude
+					const Quatf q_current(att.q);
+
+					// Desired attitude setpoint (full)
+					const Quatf q_desired = q_sp;
+
+					const Vector3f ez_world(0.f, 0.f, 1.f);
+
+					// Current and desired body Z axes expressed in world frame
+					const Vector3f ez_current = q_current.dcm_z();
+					const Vector3f ex_current = q_current.dcm_x();
+					const Vector3f ex_desired_full = q_desired.dcm_x();
+					const Vector3f ez_desired_full = q_desired.dcm_z();
+
+					Vector3f ez_desired = ez_desired_full;
+					{
+						Vector3f xhc = ex_current - ez_world * ex_current.dot(ez_world);
+						Vector3f xhd = ex_desired_full - ez_world * ex_desired_full.dot(ez_world);
+						const float n_c = xhc.norm();
+						const float n_d = xhd.norm();
+
+						if (n_c > 1e-3f && n_d > 1e-3f) {
+							xhc /= n_c;
+							xhd /= n_d;
+
+							// Signed yaw delta about ez_world that maps desired heading -> current heading
+							const float sin_yaw = ez_world.dot(xhd.cross(xhc));
+							const float cos_yaw = xhd.dot(xhc);
+							const float yaw_delta = atan2f(sin_yaw, cos_yaw);
+
+							// Rotate desired Z about ez_world by yaw_delta (Rodrigues)
+							const float c = cosf(yaw_delta);
+							const float s = sinf(yaw_delta);
+							ez_desired = ez_desired_full * c + ez_world.cross(ez_desired_full) * s
+								+ ez_world * (ez_world.dot(ez_desired_full)) * (1.f - c);
+						}
 					}
 
-					// Full 3D attitude error quaternion
-					matrix::Quatf qe = (q_current.inversed() * q_sp_modified).canonical();
+					// ---- Tilt error in BODY frame ----
+					// Use a smooth cross-product based error: e_world = ez_current x ez_desired,
+					// then express it in body frame. For small angles, |e| ~= tilt angle (rad).
+					const Vector3f e_tilt = q_current.rotateVectorInverse(ez_current.cross(ez_desired));
 
-					// Convert error to rotation vector in BODY frame
-					matrix::AxisAnglef aa(qe);
-					matrix::Vector3f rotvec_b = aa.axis() * aa.angle(); // [rad], BODY axes (FRD)
-					matrix::Vector3f body_rates_setpoint = rotvec_b.emult(_proportional_gain);
+					debug_vect_s dbg_e_tilt{};
+					dbg_e_tilt.timestamp = hrt_absolute_time();
+					strncpy(dbg_e_tilt.name, "e_tilt", sizeof(dbg_e_tilt.name));
+					dbg_e_tilt.name[sizeof(dbg_e_tilt.name) - 1] = '\0';
+					dbg_e_tilt.x = e_tilt(0);
+					dbg_e_tilt.y = e_tilt(1);
+					dbg_e_tilt.z = e_tilt(2);
+					_debug_vect_pub.publish(dbg_e_tilt);
 
-					// limit rates
-					body_rates_setpoint(0) = constrain(body_rates_setpoint(0), -radians(_param_fw_r_rmax.get()), radians(_param_fw_r_rmax.get()));
-					body_rates_setpoint(1) = constrain(body_rates_setpoint(1), -radians(_param_fw_p_rmax_neg.get()), radians(_param_fw_p_rmax_pos.get()));
-					body_rates_setpoint(2) = constrain(body_rates_setpoint(2), -radians(_param_fw_y_rmax.get()), radians(_param_fw_y_rmax.get()));
+					// Tilt-rate command (body rates p,q,r) from tilt error
+					Vector3f body_rates_setpoint;
+					body_rates_setpoint(0) = _proportional_gain(0) * e_tilt(0);   // roll rate cmd
+					body_rates_setpoint(1) = _proportional_gain(1) * e_tilt(1);   // pitch rate cmd
+					body_rates_setpoint(2) = 0.f;                                 // yaw handled below
+
+					// ---- 3) Yaw control about the *tilt axis* (no Euler yaw) ----
+					// Define yaw as rotation about desired Z (or current Z). Using desired Z is typical.
+					auto yaw_error_about_axis = [](const Vector3f &axis_world,
+								const Vector3f &ex_current_world,
+								const Vector3f &ex_desired_world) -> float
+					{
+						// Project the forward axes into the plane orthogonal to axis_world
+						Vector3f a = axis_world;
+						const float a_norm = a.norm();
+
+						if (a_norm < 1e-4f) { return 0.f; }
+						a /= a_norm;
+
+						Vector3f u = ex_current_world - a * (ex_current_world.dot(a));
+						Vector3f v = ex_desired_world - a * (ex_desired_world.dot(a));
+
+						const float un = u.norm();
+						const float vn = v.norm();
+						if (un < 1e-4f || vn < 1e-4f) { return 0.f; }
+
+						u /= un;
+						v /= vn;
+
+						// Signed angle from u -> v around axis a
+						const float sinang = a.dot(u.cross(v));
+						const float cosang = u.dot(v);
+						return atan2f(sinang, cosang);
+					};
+
+					// Current and desired body X axes (forward) in world frame
+					// (ex_current already computed above)
+					const Vector3f ex_desired = ex_desired_full;
+
+					// Yaw error about desired tilt axis (world frame)
+					const float yaw_err = yaw_error_about_axis(ez_desired, ex_current, ex_desired);
+
+					// --- Yaw-rate setpoint: choose ONE strategy or blend them ---
+
+					// (A) Yaw-hold about tilt axis (good for hover/vertical and "point where I command")
+					const float K_yaw = _proportional_gain(2); // or a dedicated yaw gain/param
+					float r_yaw_hold = K_yaw * yaw_err;
+
+					// (B) Turn coordination feedforward (good for normal fixed-wing feel)
+					// r_tc ≈ g/V * tan(bank). Compute tan(bank) geometrically without Euler angles.
+					//
+					// IMPORTANT: bank must be computed in a *heading-aligned* horizontal frame.
+					// Using raw world components like ez_current(1)/ez_current(2) makes TC depend on
+					// absolute heading (wrong), because world-Y is not the aircraft's lateral axis.
+					const float V = math::max(get_airspeed_constrained(), 0.1f);
+					float tan_bank = 0.f;
+					float tc_gate = 0.f;
+
+					// Build a heading-aligned horizontal frame from the current forward axis.
+					// x_h: current forward projected into horizontal plane
+					// y_h: horizontal right = ez_world x x_h
+					Vector3f x_h = ex_current - ez_world * ex_current.dot(ez_world);
+					const float x_h_norm = x_h.norm();
+
+					if (x_h_norm > 1e-3f) {
+						x_h /= x_h_norm;
+						const Vector3f y_h = ez_world.cross(x_h);
+
+						const float cos_tilt = ez_current.dot(ez_world);
+						// Note: for FRD body in NED world, positive roll (right wing down) makes
+						// ez_current acquire a *negative* component along y_h. Invert to get tan(bank)
+						// consistent with positive roll => positive tan(bank).
+						const float sin_bank = -ez_current.dot(y_h);
+
+						if (fabsf(cos_tilt) > 0.1f) {
+							tan_bank = sin_bank / cos_tilt;
+						}
+
+						// (C) Gate TC out when near vertical (so vertical flight uses yaw-hold instead)
+						tc_gate = math::constrain((fabsf(cos_tilt) - 0.2f) / (0.6f - 0.2f), 0.f, 1.f);
+						//   cos_tilt ~ 1 in level flight -> tc_gate ~ 1
+						//   cos_tilt ~ 0 in vertical -> tc_gate ~ 0
+					}
+
+					const float r_tc_ff = (9.81f / V) * tan_bank;
+
+					// Blend: in normal flight mostly TC; near vertical mostly yaw-hold (or zero)
+					float r_sp = tc_gate * r_tc_ff + (1.f - tc_gate) * r_yaw_hold;
+
+					// Add yaw rate about body Z
+					body_rates_setpoint(2) = r_sp;
+
+					// ---- 4) Clamp body rates ----
+					body_rates_setpoint(0) = math::constrain(body_rates_setpoint(0),
+						-radians(_param_fw_r_rmax.get()), radians(_param_fw_r_rmax.get()));
+
+					body_rates_setpoint(1) = math::constrain(body_rates_setpoint(1),
+						-radians(_param_fw_p_rmax_neg.get()), radians(_param_fw_p_rmax_pos.get()));
+
+					body_rates_setpoint(2) = math::constrain(body_rates_setpoint(2),
+						-radians(_param_fw_y_rmax.get()), radians(_param_fw_y_rmax.get()));
+
+
 					///////////////////////////////////////////////////////////////////////////
-					// End of quaternion-based controller
+					// End: Quaternion / geometric controller
 					///////////////////////////////////////////////////////////////////////////
+
 
 
 

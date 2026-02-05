@@ -67,6 +67,7 @@
 #include <uORB/topics/vehicle_rates_setpoint.h>
 #include <uORB/topics/vehicle_euler_rates_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/debug_vect.h>
 
 using matrix::Eulerf;
 using matrix::Quatf;
@@ -115,6 +116,7 @@ private:
 	uORB::Publication<vehicle_attitude_setpoint_s>	_attitude_sp_pub;
 	uORB::Publication<vehicle_rates_setpoint_s>	_rate_sp_pub{ORB_ID(vehicle_rates_setpoint)};
 	uORB::Publication<vehicle_euler_rates_setpoint_s> _euler_rates_sp_pub{ORB_ID(vehicle_euler_rates_setpoint)};
+	uORB::Publication<debug_vect_s> _debug_vect_pub{ORB_ID(debug_vect)};
 	uORB::Publication<landing_gear_wheel_s>		_landing_gear_wheel_pub{ORB_ID(landing_gear_wheel)};
 
 	manual_control_setpoint_s		_manual_control_setpoint{};
@@ -173,7 +175,7 @@ private:
 	WheelController _wheel_ctrl;
 
 	void parameters_update();
-	void vehicle_manual_poll(matrix::Quatf R, float airspeed, float dt);
+	void vehicle_manual_poll(const float yaw_body);
 	void vehicle_attitude_setpoint_poll();
 	void vehicle_land_detected_poll();
 	float get_airspeed_constrained();
