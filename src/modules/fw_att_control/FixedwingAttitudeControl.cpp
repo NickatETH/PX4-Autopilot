@@ -49,6 +49,7 @@ FixedwingAttitudeControl::FixedwingAttitudeControl(bool vtol) :
 	parameters_update();
 	_landing_gear_wheel_pub.advertise();
 	_attitude_sp_pub.advertise();
+	_debug_vect_pub.advertise();
 }
 
 FixedwingAttitudeControl::~FixedwingAttitudeControl()
@@ -335,43 +336,60 @@ void FixedwingAttitudeControl::Run()
 					// Desired attitude setpoint (full)
 					const Quatf q_desired = q_sp;
 
+					// World "up" axis (keep as in your code)
 					const Vector3f ez_world(0.f, 0.f, 1.f);
 
-					// Current and desired body Z axes expressed in world frame
-					const Vector3f ez_current = q_current.dcm_z();
-					const Vector3f ex_current = q_current.dcm_x();
-					const Vector3f ex_desired_full = q_desired.dcm_x();
-					const Vector3f ez_desired_full = q_desired.dcm_z();
+					// Current body axes expressed in world frame (from quaternion body->world)
+					const Vector3f ez_current = q_current.dcm_z(); // body +Z in world
+					const Vector3f ex_current = q_current.dcm_x(); // body +X in world
 
-					Vector3f ez_desired = ez_desired_full;
-					{
-						Vector3f xhc = ex_current - ez_world * ex_current.dot(ez_world);
-						Vector3f xhd = ex_desired_full - ez_world * ex_desired_full.dot(ez_world);
-						const float n_c = xhc.norm();
-						const float n_d = xhd.norm();
+					// ------------------------------------------------------------
+					// 0) Blend weight: level (lift) vs vertical (thrust)
+					// ------------------------------------------------------------
+					// cos_tilt ~ 1 in upright level-ish flight, ~0 when vertical.
+					// (Uses current attitude only; can also incorporate airspeed if you want.)
+					const float cos_tilt = ez_current.dot(ez_world);
+					const float w_lift = math::constrain((fabsf(cos_tilt) - 0.2f) / (0.6f - 0.2f), 0.f, 1.f);
+					// w_lift = 1 -> track lift axis (-Zb) like normal FW tilt control
+					// w_lift = 0 -> track thrust axis (+Xb) for vertical flight
 
-						if (n_c > 1e-3f && n_d > 1e-3f) {
-							xhc /= n_c;
-							xhd /= n_d;
+					// ------------------------------------------------------------
+					// 1) Define primary "force" axis in BODY frame and rotate to world
+					// ------------------------------------------------------------
+					// PX4 body frame is typically FRD: +X fwd, +Y right, +Z down.
+					const Vector3f ex_b(1.f, 0.f, 0.f);
+					const Vector3f ez_b(0.f, 0.f, 1.f);
 
-							// Signed yaw delta about ez_world that maps desired heading -> current heading
-							const float sin_yaw = ez_world.dot(xhd.cross(xhc));
-							const float cos_yaw = xhd.dot(xhc);
-							const float yaw_delta = atan2f(sin_yaw, cos_yaw);
+					// Lift axis (direction of aerodynamic lift in body coordinates) ~ "up" in body = -Zb
+					const Vector3f lift_axis_b = -ez_b;
 
-							// Rotate desired Z about ez_world by yaw_delta (Rodrigues)
-							const float c = cosf(yaw_delta);
-							const float s = sinf(yaw_delta);
-							ez_desired = ez_desired_full * c + ez_world.cross(ez_desired_full) * s
-								+ ez_world * (ez_world.dot(ez_desired_full)) * (1.f - c);
-						}
+					// Thrust axis (direction of prop thrust) ~ +Xb
+					const Vector3f thrust_axis_b = ex_b;
+
+					// Primary controlled axis in BODY frame (blend lift/thrust)
+					Vector3f a_body = lift_axis_b * w_lift + thrust_axis_b * (1.f - w_lift);
+					const float a_norm = a_body.norm();
+					if (a_norm > 1e-4f) {
+						a_body /= a_norm;
+					} else {
+						a_body = lift_axis_b;
 					}
 
-					// ---- Tilt error in BODY frame ----
-					// Use a smooth cross-product based error: e_world = ez_current x ez_desired,
-					// then express it in body frame. For small angles, |e| ~= tilt angle (rad).
-					const Vector3f e_tilt = q_current.rotateVectorInverse(ez_current.cross(ez_desired));
+					// Primary axis in WORLD frame (current & desired)
+					const Vector3f a_current_w = q_current.rotateVector(a_body);
+					const Vector3f a_desired_w = q_desired.rotateVector(a_body);
 
+					// ------------------------------------------------------------
+					// 2) Primary-axis geometric error -> "tilt" error in BODY frame
+					// ------------------------------------------------------------
+					// Raw error axis in world: a_current x a_desired
+					Vector3f e_primary_b = q_current.rotateVectorInverse(a_current_w.cross(a_desired_w));
+
+					// Remove component about the primary axis (yaw-about-axis handled separately)
+					const float e_along = e_primary_b.dot(a_body);
+					Vector3f e_tilt = e_primary_b - a_body * e_along;
+
+					// Debug (optional)
 					debug_vect_s dbg_e_tilt{};
 					dbg_e_tilt.timestamp = hrt_absolute_time();
 					strncpy(dbg_e_tilt.name, "e_tilt", sizeof(dbg_e_tilt.name));
@@ -381,27 +399,34 @@ void FixedwingAttitudeControl::Run()
 					dbg_e_tilt.z = e_tilt(2);
 					_debug_vect_pub.publish(dbg_e_tilt);
 
-					// Tilt-rate command (body rates p,q,r) from tilt error
+					// ------------------------------------------------------------
+					// 3) Tilt-rate command from tilt error (BODY rates)
+					// ------------------------------------------------------------
+					// Extract roll component, scale down to prioritize pitch, then recombine
+					const float roll_error = e_tilt(0);
+					Vector3f e_tilt_scaled = e_tilt;
+					e_tilt_scaled(0) = roll_error * _param_fw_geom_r_scale.get();
+
 					Vector3f body_rates_setpoint;
-					body_rates_setpoint(0) = _proportional_gain(0) * e_tilt(0);   // roll rate cmd
-					body_rates_setpoint(1) = _proportional_gain(1) * e_tilt(1);   // pitch rate cmd
-					body_rates_setpoint(2) = 0.f;                                 // yaw handled below
+					body_rates_setpoint(0) = _proportional_gain(0) * e_tilt_scaled(0);
+					body_rates_setpoint(1) = _proportional_gain(1) * e_tilt_scaled(1);
+					body_rates_setpoint(2) = _proportional_gain(2) * e_tilt_scaled(2);
 
-					// ---- 3) Yaw control about the *tilt axis* (no Euler yaw) ----
-					// Define yaw as rotation about desired Z (or current Z). Using desired Z is typical.
+					// ------------------------------------------------------------
+					// 4) Yaw control about the PRIMARY axis (generalized yaw)
+					// ------------------------------------------------------------
 					auto yaw_error_about_axis = [](const Vector3f &axis_world,
-								const Vector3f &ex_current_world,
-								const Vector3f &ex_desired_world) -> float
+								const Vector3f &ref_current_world,
+								const Vector3f &ref_desired_world) -> float
 					{
-						// Project the forward axes into the plane orthogonal to axis_world
-						Vector3f a = axis_world;
-						const float a_norm = a.norm();
+						Vector3f ax = axis_world;
+						const float a_nor = ax.norm();
+						if (a_nor < 1e-4f) { return 0.f; }
+						ax /= a_nor;
 
-						if (a_norm < 1e-4f) { return 0.f; }
-						a /= a_norm;
-
-						Vector3f u = ex_current_world - a * (ex_current_world.dot(a));
-						Vector3f v = ex_desired_world - a * (ex_desired_world.dot(a));
+						// Project references into plane orthogonal to axis
+						Vector3f u = ref_current_world - ax * (ref_current_world.dot(ax));
+						Vector3f v = ref_desired_world - ax * (ref_desired_world.dot(ax));
 
 						const float un = u.norm();
 						const float vn = v.norm();
@@ -410,38 +435,54 @@ void FixedwingAttitudeControl::Run()
 						u /= un;
 						v /= vn;
 
-						// Signed angle from u -> v around axis a
-						const float sinang = a.dot(u.cross(v));
+						const float sinang = ax.dot(u.cross(v));
 						const float cosang = u.dot(v);
 						return atan2f(sinang, cosang);
 					};
 
-					// Current and desired body X axes (forward) in world frame
-					// (ex_current already computed above)
-					const Vector3f ex_desired = ex_desired_full;
+					// Secondary reference axis in BODY to define yaw-about-primary.
+					// Level (lift) -> use nose direction (+Xb) for heading
+					// Vertical (thrust) -> use "up" (-Zb) to define rotation about +Xb
+					Vector3f b_body = ex_b * w_lift + (-ez_b) * (1.f - w_lift);
 
-					// Yaw error about desired tilt axis (world frame)
-					const float yaw_err = yaw_error_about_axis(ez_desired, ex_current, ex_desired);
+					// Orthogonalize b_body against a_body (Gram-Schmidt)
+					b_body -= a_body * (b_body.dot(a_body));
+					const float b_norm = b_body.norm();
+					if (b_norm > 1e-4f) {
+						b_body /= b_norm;
+					} else {
+						// Fallback: choose Y axis, then orthogonalize once more
+						b_body = Vector3f(0.f, 1.f, 0.f);
+						b_body -= a_body * (b_body.dot(a_body));
+						const float b2 = b_body.norm();
+						if (b2 > 1e-4f) { b_body /= b2; }
+					}
 
-					// --- Yaw-rate setpoint: choose ONE strategy or blend them ---
+					// Rotate b_body to world for current/desired
+					const Vector3f b_current_w = q_current.rotateVector(b_body);
+					const Vector3f b_desired_w = q_desired.rotateVector(b_body);
 
-					// (A) Yaw-hold about tilt axis (good for hover/vertical and "point where I command")
-					const float K_yaw = _proportional_gain(2); // or a dedicated yaw gain/param
-					float r_yaw_hold = K_yaw * yaw_err;
+					// Yaw error about desired primary axis
+					const float yaw_err = yaw_error_about_axis(a_desired_w, b_current_w, b_desired_w);
 
-					// (B) Turn coordination feedforward (good for normal fixed-wing feel)
-					// r_tc ≈ g/V * tan(bank). Compute tan(bank) geometrically without Euler angles.
-					//
-					// IMPORTANT: bank must be computed in a *heading-aligned* horizontal frame.
-					// Using raw world components like ez_current(1)/ez_current(2) makes TC depend on
-					// absolute heading (wrong), because world-Y is not the aircraft's lateral axis.
+					// Yaw-hold about primary axis (used strongly near vertical)
+					const float K_yaw = _proportional_gain(2);
+
+					Vector3f yaw_axis_b = ez_b * w_lift + a_body * (1.f - w_lift);
+					yaw_axis_b.normalize();
+
+					body_rates_setpoint += yaw_axis_b * (K_yaw * yaw_err);
+
+					// ------------------------------------------------------------
+					// 5) Turn coordination feedforward (gated to level flight)
+					// ------------------------------------------------------------
+					// Keep your existing heading-aligned bank estimation (good!).
 					const float V = math::max(get_airspeed_constrained(), 0.1f);
+
 					float tan_bank = 0.f;
 					float tc_gate = 0.f;
 
-					// Build a heading-aligned horizontal frame from the current forward axis.
-					// x_h: current forward projected into horizontal plane
-					// y_h: horizontal right = ez_world x x_h
+					// heading-aligned horizontal frame using current forward axis
 					Vector3f x_h = ex_current - ez_world * ex_current.dot(ez_world);
 					const float x_h_norm = x_h.norm();
 
@@ -449,31 +490,26 @@ void FixedwingAttitudeControl::Run()
 						x_h /= x_h_norm;
 						const Vector3f y_h = ez_world.cross(x_h);
 
-						const float cos_tilt = ez_current.dot(ez_world);
-						// Note: for FRD body in NED world, positive roll (right wing down) makes
-						// ez_current acquire a *negative* component along y_h. Invert to get tan(bank)
-						// consistent with positive roll => positive tan(bank).
+						// Reuse cos_tilt from above
+						// For FRD body in NED world, sign may need inversion; keep your original sign convention.
 						const float sin_bank = -ez_current.dot(y_h);
 
 						if (fabsf(cos_tilt) > 0.1f) {
 							tan_bank = sin_bank / cos_tilt;
 						}
 
-						// (C) Gate TC out when near vertical (so vertical flight uses yaw-hold instead)
+						// Gate TC out near vertical (same shape as w_lift, but keep separate if you like)
 						tc_gate = math::constrain((fabsf(cos_tilt) - 0.2f) / (0.6f - 0.2f), 0.f, 1.f);
-						//   cos_tilt ~ 1 in level flight -> tc_gate ~ 1
-						//   cos_tilt ~ 0 in vertical -> tc_gate ~ 0
 					}
 
 					const float r_tc_ff = (9.81f / V) * tan_bank;
 
-					// Blend: in normal flight mostly TC; near vertical mostly yaw-hold (or zero)
-					float r_sp = tc_gate * r_tc_ff + (1.f - tc_gate) * r_yaw_hold;
+					// Add TC as classic yaw-rate about BODY Z (valid near level flight)
+					body_rates_setpoint(2) += tc_gate * r_tc_ff;
 
-					// Add yaw rate about body Z
-					body_rates_setpoint(2) = r_sp;
-
-					// ---- 4) Clamp body rates ----
+					// ------------------------------------------------------------
+					// 6) Clamp body rates (unchanged)
+					// ------------------------------------------------------------
 					body_rates_setpoint(0) = math::constrain(body_rates_setpoint(0),
 						-radians(_param_fw_r_rmax.get()), radians(_param_fw_r_rmax.get()));
 

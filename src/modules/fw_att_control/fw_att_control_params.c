@@ -269,3 +269,19 @@ PARAM_DEFINE_FLOAT(FW_MAN_P_MAX, 30.0f);
  * @group FW Attitude Control
  */
 PARAM_DEFINE_FLOAT(FW_Y_TC, 1.0f);
+
+/**
+ * Geometric controller roll scale
+ *
+ * Scaling factor for roll component in tilt error.
+ * Extracts roll, multiplies by this factor, then recombines.
+ * 1.0 = equal authority, <1.0 = prioritize pitch over roll.
+ *
+ * @unit norm
+ * @min 0.1
+ * @max 1.0
+ * @decimal 2
+ * @increment 0.05
+ * @group FW Attitude Control
+ */
+PARAM_DEFINE_FLOAT(FW_GEOM_R_SCALE, 1.0f);

@@ -164,7 +164,9 @@ private:
 
 		(ParamFloat<px4::params::FW_Y_RMAX>) _param_fw_y_rmax,
 		(ParamFloat<px4::params::FW_MAN_YR_MAX>) _param_man_yr_max,
-		(ParamFloat<px4::params::FW_Y_TC>) _param_fw_y_tc
+		(ParamFloat<px4::params::FW_Y_TC>) _param_fw_y_tc,
+
+		(ParamFloat<px4::params::FW_GEOM_R_SCALE>) _param_fw_geom_r_scale
 	)
 
 	matrix::Vector3f _proportional_gain;
