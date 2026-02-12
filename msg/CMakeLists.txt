@@ -236,7 +236,6 @@ set(msg_files
 	VehicleMagnetometer.msg
 	VehicleOpticalFlow.msg
 	VehicleOpticalFlowVel.msg
-	VehicleEulerRatesSetpoint.msg
 	VehicleRoi.msg
 	VehicleThrustSetpoint.msg
 	VehicleTorqueSetpoint.msg
