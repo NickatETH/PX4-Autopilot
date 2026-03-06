@@ -906,9 +906,11 @@ MavlinkMissionManager::handle_mission_count(const mavlink_message_t *msg)
 		if (_state == MAVLINK_WPM_STATE_IDLE) {
 			_time_last_recv = hrt_absolute_time();
 
-			if (_transfer_in_progress) { // Transfer over different mavlink instance. ignore
-				send_mission_ack(msg->sysid, msg->compid, MAV_MISSION_ERROR);
-				return;
+			if (_transfer_in_progress) {
+				// Another mavlink instance has a transfer in progress, but our link is idle.
+				// This can happen when switching links (e.g., USB to telemetry) mid-transfer.
+				// Allow the new link to take over instead of forcing the user to wait for timeout.
+				PX4_INFO("WPM: Taking over incomplete transfer from another link");
 			}
 
 			_transfer_in_progress = true;
