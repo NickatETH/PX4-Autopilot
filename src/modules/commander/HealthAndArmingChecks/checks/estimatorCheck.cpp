@@ -630,7 +630,7 @@ void EstimatorChecks::checkEstimatorStatusFlags(const Context &context, Report &
 
 void EstimatorChecks::checkGps(const Context &context, Report &reporter, const sensor_gps_s &vehicle_gps_position) const
 {
-	if (vehicle_gps_position.jamming_state == sensor_gps_s::JAMMING_STATE_DETECTED) {
+	if (vehicle_gps_position.jamming_state == sensor_gps_s::JAMMING_STATE_DETECTED || _param_com_arm_gps_jam.get()) {
 		/* EVENT
 		 */
 		reporter.armingCheckFailure(NavModes::None, health_component_t::gps,

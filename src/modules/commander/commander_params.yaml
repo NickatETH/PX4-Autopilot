@@ -291,6 +291,14 @@ parameters:
         1: Deny arming
         2: Warning only
       default: 2
+    COM_ARM_GPS_JAM:
+      description:
+        short: GPS jamming detection test
+        long: |-
+          If enabled, triggers the GPS jamming check for testing purposes.
+          This allows testing the jamming detection logic without actual GPS jamming.
+      type: boolean
+      default: 0
     COM_RC_OVERRIDE:
       description:
         short: Enable manual control stick override
